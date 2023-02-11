@@ -35,9 +35,16 @@ impl From<TryRecvError> for MessageBufferError {
 }
 
 /// backoff setting
+/// trait ???
+/// fn next_duration()
+/// fn reset()
 struct BackOff {}
 
 /// batch setting
+/// timeout(duration, poll)
+/// poll: while res.len() < size {
+///        queue.recv().await
+/// }
 struct Batcher {
     size: usize,
     timeout: time::Duration,
@@ -51,7 +58,7 @@ struct MessageBuffer<T> {
 impl<T: Send + 'static> MessageBuffer<T> {
     fn new<F, Fut, E>(cb: F, backoff: BackOff) -> (Self, mpsc::Receiver<E>)
     where
-        F: Fn(Item<T>) -> Fut + Send + 'static,
+        F: Fn(Vec<Item<T>>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Operation, E>> + Send + 'static,
         E: Send + 'static,
     {
@@ -65,7 +72,7 @@ impl<T: Send + 'static> MessageBuffer<T> {
         backoff: BackOff,
     ) -> (Self, mpsc::Receiver<E>)
     where
-        F: Fn(Item<T>) -> Fut + Send + 'static,
+        F: Fn(Vec<Item<T>>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Operation, E>> + Send + 'static,
         E: Send + 'static,
     {
@@ -102,7 +109,7 @@ enum Operation {
 
 struct Worker<F, Fut, T, E>
 where
-    F: Fn(Item<T>) -> Fut + Send + 'static,
+    F: Fn(Vec<Item<T>>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<Operation, E>> + Send + 'static,
     E: Send + 'static,
 {
@@ -116,7 +123,7 @@ where
 
 impl<F, Fut, T, E> Worker<F, Fut, T, E>
 where
-    F: Fn(Item<T>) -> Fut + Send + 'static,
+    F: Fn(Vec<Item<T>>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<Operation, E>> + Send + 'static,
     E: Send + 'static,
 {
