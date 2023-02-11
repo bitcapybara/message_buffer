@@ -8,6 +8,7 @@ use tokio::{
         error::{TryRecvError, TrySendError},
     },
     task::JoinHandle,
+    time,
 };
 
 enum MessageBufferError {
@@ -33,8 +34,14 @@ impl From<TryRecvError> for MessageBufferError {
     }
 }
 
-/// backoff
+/// backoff setting
 struct BackOff {}
+
+/// batch setting
+struct Batcher {
+    size: usize,
+    timeout: time::Duration,
+}
 
 struct MessageBuffer<T> {
     main_tx: mpsc::Sender<T>,
