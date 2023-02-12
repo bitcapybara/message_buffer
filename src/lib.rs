@@ -40,10 +40,6 @@ impl Batch {
 }
 
 /// batch setting
-/// timeout(duration, poll)
-/// poll: while res.len() < size {
-///        queue.recv().await
-/// }
 struct Batcher(Option<Batch>);
 
 impl Batcher {
@@ -67,28 +63,12 @@ impl Batcher {
         main_rx: &mut mpsc::Receiver<Item<T>>,
         retry_q: &mut DelayQueue<Item<T>>,
     ) -> Result<Item<T>, MessageBufferError> {
-        loop {
-            select! {
-                msg_res = main_rx.recv() => {
-                    match msg_res {
-                        Some(msg) => {
-                            return Ok(msg);
-                        }
-                        None => {
-                            return Err(MessageBufferError::Stopped);
-                        }
-                    }
-                }
-                ex_res = retry_q.next() => {
-                    match ex_res {
-                        Some(msg) => {
-                            return Ok(msg.into_inner());
-                        }
-                        None => {
-                            return Err(MessageBufferError::Stopped);
-                        }
-                    }
-                }
+        select! {
+            msg_res = main_rx.recv() => {
+                msg_res.ok_or(MessageBufferError::Stopped)
+            }
+            ex_res = retry_q.next() => {
+                ex_res.map(|e| e.into_inner()).ok_or(MessageBufferError::Stopped)
             }
         }
     }
