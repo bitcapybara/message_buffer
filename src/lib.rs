@@ -5,10 +5,7 @@ use std::{collections::HashMap, future::Future, time::Duration};
 use futures::StreamExt;
 use tokio::{
     select,
-    sync::mpsc::{
-        self,
-        error::{TryRecvError, TrySendError},
-    },
+    sync::mpsc::{self, error::TrySendError},
     task::JoinHandle,
     time::timeout,
 };
@@ -24,15 +21,6 @@ impl<T> From<TrySendError<T>> for MessageBufferError {
         match e {
             TrySendError::Full(_) => Self::QueueFull,
             TrySendError::Closed(_) => Self::Stopped,
-        }
-    }
-}
-
-impl From<TryRecvError> for MessageBufferError {
-    fn from(e: TryRecvError) -> Self {
-        match e {
-            TryRecvError::Empty => unreachable!(),
-            TryRecvError::Disconnected => Self::Stopped,
         }
     }
 }
