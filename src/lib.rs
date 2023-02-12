@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, time::Duration};
 
+use futures::StreamExt;
 use tokio::{
+    select,
     sync::mpsc::{
         self,
         error::{TryRecvError, TrySendError},
@@ -10,6 +12,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+use tokio_util::time::DelayQueue;
 
 enum MessageBufferError {
     QueueFull,
@@ -34,17 +37,12 @@ impl From<TryRecvError> for MessageBufferError {
     }
 }
 
-/// TODO backoff setting, used in retry
-/// fn next_duration()
-/// fn reset()
-// struct BackOff {}
-
-struct BatchConf {
+struct Batch {
     batch_size: usize,
     timeout: Duration,
 }
 
-impl BatchConf {
+impl Batch {
     fn new(batch_size: usize, timeout: Duration) -> Self {
         Self {
             batch_size,
@@ -58,40 +56,66 @@ impl BatchConf {
 /// poll: while res.len() < size {
 ///        queue.recv().await
 /// }
-struct Batcher(Option<BatchConf>);
+struct Batcher(Option<Batch>);
 
 impl Batcher {
     /// if timeout elapsed, return Ok(Vec), vec may be empty
     /// if queue closed, return Err(Stopped)
-    async fn poll<T>(&self, queue: &mut mpsc::Receiver<T>) -> Result<Vec<T>, MessageBufferError> {
+    async fn poll<T: Clone>(
+        &self,
+        main_rx: &mut mpsc::Receiver<Item<T>>,
+        retry_q: &mut DelayQueue<Item<T>>,
+    ) -> Result<Vec<Item<T>>, MessageBufferError> {
         match self.0 {
-            Some(BatchConf {
+            Some(Batch {
                 batch_size,
                 timeout,
-            }) => Self::poll_batch(batch_size, timeout, queue).await,
-            None => todo!(),
+            }) => Self::poll_batch(batch_size, timeout, main_rx, retry_q).await,
+            None => Self::poll_one(main_rx, retry_q).await.map(|msg| vec![msg]),
         }
     }
 
-    async fn poll_one<T>(queue: &mut mpsc::Receiver<T>) -> Result<T, MessageBufferError> {
-        match queue.recv().await {
-            Some(msg) => Ok(msg),
-            None => Err(MessageBufferError::Stopped),
+    async fn poll_one<T: Clone>(
+        main_rx: &mut mpsc::Receiver<Item<T>>,
+        retry_q: &mut DelayQueue<Item<T>>,
+    ) -> Result<Item<T>, MessageBufferError> {
+        loop {
+            select! {
+                msg_res = main_rx.recv() => {
+                    match msg_res {
+                        Some(msg) => {
+                            return Ok(msg);
+                        }
+                        None => {
+                            return Err(MessageBufferError::Stopped);
+                        }
+                    }
+                }
+                ex_res = retry_q.next() => {
+                    match ex_res {
+                        Some(msg) => {
+                            return Ok(msg.into_inner());
+                        }
+                        None => {
+                            return Err(MessageBufferError::Stopped);
+                        }
+                    }
+                }
+            }
         }
     }
 
-    async fn poll_batch<T>(
+    async fn poll_batch<T: Clone>(
         bsz: usize,
         tmot: Duration,
-        queue: &mut mpsc::Receiver<T>,
-    ) -> Result<Vec<T>, MessageBufferError> {
+        main_rx: &mut mpsc::Receiver<Item<T>>,
+        retry_q: &mut DelayQueue<Item<T>>,
+    ) -> Result<Vec<Item<T>>, MessageBufferError> {
         let mut msgs = Vec::with_capacity(bsz);
         match timeout(tmot, async {
             while msgs.len() < bsz {
-                match queue.recv().await {
-                    Some(msg) => msgs.push(msg),
-                    None => return Err(MessageBufferError::Stopped),
-                }
+                let msg = Self::poll_one(main_rx, retry_q).await?;
+                msgs.push(msg);
             }
             Ok(())
         })
@@ -121,14 +145,14 @@ impl Options {
 }
 
 struct OptionsBuilder {
-    batch: Option<BatchConf>,
+    batch: Option<Batch>,
     rcv_err: bool,
     cap: usize,
 }
 
 impl OptionsBuilder {
     fn batch(mut self, batch_size: usize, timeout: Duration) -> Self {
-        self.batch = Some(BatchConf::new(batch_size, timeout));
+        self.batch = Some(Batch::new(batch_size, timeout));
         self
     }
 
@@ -151,17 +175,18 @@ impl OptionsBuilder {
     }
 }
 
-struct MessageBuffer<T, E> {
-    main_tx: mpsc::Sender<T>,
+struct MessageBuffer<T: Clone, E> {
+    id_gen: usize,
+    main_tx: mpsc::Sender<Item<T>>,
     error_rx: Option<mpsc::Receiver<E>>,
     handle: JoinHandle<Result<(), MessageBufferError>>,
 }
 
-impl<T: Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
+impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
     fn with_capacity<F, Fut>(cb: F, options: Options) -> Self
     where
         F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Operation, E>> + Send + 'static,
+        Fut: Future<Output = Result<ItemOp, E>> + Send + 'static,
     {
         let (main_tx, main_rx) = mpsc::channel(options.cap);
         let (mut error_tx, mut error_rx) = (None, None);
@@ -176,14 +201,20 @@ impl<T: Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
         let handle = tokio::spawn(worker.start());
 
         Self {
+            id_gen: 0,
             main_tx,
             handle,
             error_rx,
         }
     }
 
-    async fn push(&self, msg: T) -> Result<(), MessageBufferError> {
-        Ok(self.main_tx.try_send(msg)?)
+    async fn push(&mut self, msg: T) -> Result<(), MessageBufferError> {
+        self.id_gen += 1;
+        Ok(self.main_tx.try_send(Item {
+            id: self.id_gen,
+            data: msg,
+            trys: 0,
+        })?)
     }
 
     async fn error_receiver(&mut self) -> Option<mpsc::Receiver<E>> {
@@ -198,66 +229,83 @@ impl<T: Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
 
 /// msg and exec count
 /// 0 for new msg
-struct Item<T>(T, usize);
+#[derive(Clone)]
+struct Item<T: Clone> {
+    id: usize,
+    data: T,
+    trys: usize,
+}
 
-enum Operation {
+enum ItemOp {
     /// send msg to retry queue
-    Retry,
+    /// duration to delay
+    Retry(usize, Duration),
     /// drop the msg, no need to retry
-    Drop,
+    Drop(usize),
 }
 
 struct Worker<F, Fut, T, E>
 where
     F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Operation, E>> + Send + 'static,
+    Fut: Future<Output = Result<ItemOp, E>> + Send + 'static,
+    T: Clone,
     E: Send + 'static,
 {
-    cb: Arc<F>,
-    main_rx: mpsc::Receiver<T>,
+    cb: F,
+    main_rx: mpsc::Receiver<Item<T>>,
     error_tx: Option<mpsc::Sender<E>>,
     batcher: Batcher,
+    retry_q: DelayQueue<Item<T>>,
 }
 
 impl<F, Fut, T, E> Worker<F, Fut, T, E>
 where
     F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Operation, E>> + Send + 'static,
+    Fut: Future<Output = Result<ItemOp, E>> + Send + 'static,
+    T: Clone,
     E: Send + 'static,
 {
     fn new(
         batcher: Batcher,
         cb: F,
-        main_rx: mpsc::Receiver<T>,
+        main_rx: mpsc::Receiver<Item<T>>,
         error_tx: Option<mpsc::Sender<E>>,
     ) -> Self {
         Self {
-            cb: Arc::new(cb),
+            cb,
             main_rx,
             error_tx,
             batcher,
+            retry_q: DelayQueue::new(),
         }
     }
 
     async fn start(mut self) -> Result<(), MessageBufferError> {
-        let msgs = self
-            .batcher
-            .poll(&mut self.main_rx)
-            .await?
-            .into_iter()
-            .map(|msg| Item(msg, 0))
-            .collect::<Vec<Item<T>>>();
+        let mut s = HashMap::new();
+        loop {
+            let msgs = self
+                .batcher
+                .poll(&mut self.main_rx, &mut self.retry_q)
+                .await?;
+            for msg in msgs.iter() {
+                s.insert(msg.id, msg.clone());
+            }
 
-        match (self.cb.clone())(msgs).await {
-            Ok(Operation::Drop) => {}
-            Ok(Operation::Retry) => {}
-            Err(e) => {
-                if let Some(e_tx) = self.error_tx {
-                    let _ = e_tx.try_send(e);
+            match (self.cb)(msgs).await {
+                Ok(ItemOp::Drop(id)) => {
+                    s.remove(&id);
+                }
+                Ok(ItemOp::Retry(id, duration)) => {
+                    if let Some(item) = s.get(&id) {
+                        self.retry_q.insert(item.clone(), duration);
+                    }
+                }
+                Err(e) => {
+                    if let Some(e_tx) = &self.error_tx {
+                        let _ = e_tx.try_send(e);
+                    }
                 }
             }
         }
-
-        Ok(())
     }
 }

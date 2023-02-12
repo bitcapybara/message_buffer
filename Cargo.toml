@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-slab = "0.4.7"
-tokio = { version = "1.25.0", features = ["rt", "macros", "sync", "rt-multi-thread", "time"] }
+futures = "0.3.26"
+tokio = { version = "1.25.0", features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7.6", features = ["time"] }
