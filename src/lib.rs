@@ -204,6 +204,16 @@ struct Item<T: Clone> {
     trys: usize,
 }
 
+impl<T: Clone> Item<T> {
+    fn retry(&self) -> Self {
+        Self {
+            id: self.id,
+            data: self.data.clone(),
+            trys: self.trys + 1,
+        }
+    }
+}
+
 enum ItemOp {
     /// send msg to retry queue
     /// duration to delay
@@ -265,7 +275,7 @@ where
                 }
                 Ok(ItemOp::Retry(id, duration)) => {
                     if let Some(item) = s.get(&id) {
-                        self.retry_q.insert(item.clone(), duration);
+                        self.retry_q.insert(item.retry(), duration);
                     }
                 }
                 Err(e) => {
