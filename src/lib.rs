@@ -154,7 +154,7 @@ impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
     fn with_capacity<F, Fut>(cb: F, options: Options) -> Self
     where
         F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ItemOp, E>> + Send + 'static,
+        Fut: Future<Output = Result<Vec<Retry>, E>> + Send + 'static,
     {
         let (main_tx, main_rx) = mpsc::channel(options.cap);
         let (mut error_tx, mut error_rx) = (None, None);
@@ -214,18 +214,24 @@ impl<T: Clone> Item<T> {
     }
 }
 
-enum ItemOp {
-    /// send msg to retry queue
-    /// duration to delay
-    Retry(usize, Duration),
-    /// drop the msg, no need to retry
-    Drop(usize),
+/// send msg to retry queue
+/// duration to delay
+struct Retry(usize, Duration);
+
+impl Retry {
+    fn id(&self) -> usize {
+        self.0
+    }
+
+    fn duration(&self) -> Duration {
+        self.1
+    }
 }
 
 struct Worker<F, Fut, T, E>
 where
     F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<ItemOp, E>> + Send + 'static,
+    Fut: Future<Output = Result<Vec<Retry>, E>> + Send + 'static,
     T: Clone,
     E: Send + 'static,
 {
@@ -239,7 +245,7 @@ where
 impl<F, Fut, T, E> Worker<F, Fut, T, E>
 where
     F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<ItemOp, E>> + Send + 'static,
+    Fut: Future<Output = Result<Vec<Retry>, E>> + Send + 'static,
     T: Clone,
     E: Send + 'static,
 {
@@ -259,31 +265,31 @@ where
     }
 
     async fn start(mut self) -> Result<(), MessageBufferError> {
-        let mut s = HashMap::new();
+        // store msgs for retry query
+        let mut msg_map = HashMap::new();
         loop {
             let msgs = self
                 .batcher
                 .poll(&mut self.main_rx, &mut self.retry_q)
                 .await?;
             for msg in msgs.iter() {
-                s.insert(msg.id, msg.clone());
+                msg_map.insert(msg.id, msg.clone());
             }
 
             match (self.cb)(msgs).await {
-                Ok(ItemOp::Drop(id)) => {
-                    s.remove(&id);
-                }
-                Ok(ItemOp::Retry(id, duration)) => {
-                    if let Some(item) = s.get(&id) {
-                        self.retry_q.insert(item.retry(), duration);
+                Ok(ops) => ops.iter().for_each(|retry| {
+                    if let Some(item) = msg_map.get(&retry.id()) {
+                        self.retry_q.insert(item.retry(), retry.duration());
                     }
-                }
+                }),
                 Err(e) => {
                     if let Some(e_tx) = &self.error_tx {
                         let _ = e_tx.try_send(e);
                     }
                 }
             }
+            // clear map for next loop use
+            msg_map.clear();
         }
     }
 }
