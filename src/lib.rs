@@ -151,10 +151,11 @@ struct MessageBuffer<T: Clone, E> {
 }
 
 impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
-    fn with_capacity<F, Fut>(cb: F, options: Options) -> Self
+    fn with_capacity<F, Fut, B>(cb: F, backoff: B, options: Options) -> Self
     where
         F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<Retry>, E>> + Send + 'static,
+        B: BackOff + Send + 'static,
     {
         let (main_tx, main_rx) = mpsc::channel(options.cap);
         let (mut error_tx, mut error_rx) = (None, None);
@@ -165,7 +166,7 @@ impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
         }
 
         // start worker
-        let worker = Worker::new(options.batcher, cb, main_rx, error_tx);
+        let worker = Worker::new(options.batcher, cb, backoff, main_rx, error_tx);
         let handle = tokio::spawn(worker.start());
 
         Self {
@@ -216,47 +217,65 @@ impl<T: Clone> Item<T> {
 
 /// send msg to retry queue
 /// duration to delay
-struct Retry(usize, Duration);
+pub struct Retry(usize);
 
-impl Retry {
-    fn id(&self) -> usize {
-        self.0
-    }
+trait BackOff {
+    fn next(&mut self) -> Duration;
+}
 
-    fn duration(&self) -> Duration {
-        self.1
+struct ConstantBackOff(Duration);
+
+impl BackOff for ConstantBackOff {
+    fn next(&mut self) -> Duration {
+        todo!()
     }
 }
 
-struct Worker<F, Fut, T, E>
+struct ExponentBackOff {
+    factor: usize,
+    max: Duration,
+}
+
+impl BackOff for ExponentBackOff {
+    fn next(&mut self) -> Duration {
+        todo!()
+    }
+}
+
+struct Worker<F, Fut, T, E, B>
 where
     F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Vec<Retry>, E>> + Send + 'static,
     T: Clone,
     E: Send + 'static,
+    B: BackOff + Send + 'static,
 {
     cb: F,
+    backoff: B,
     main_rx: mpsc::Receiver<Item<T>>,
     error_tx: Option<mpsc::Sender<E>>,
     batcher: Batcher,
     retry_q: DelayQueue<Item<T>>,
 }
 
-impl<F, Fut, T, E> Worker<F, Fut, T, E>
+impl<F, Fut, T, E, B> Worker<F, Fut, T, E, B>
 where
     F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Vec<Retry>, E>> + Send + 'static,
     T: Clone,
     E: Send + 'static,
+    B: BackOff + Send + 'static,
 {
     fn new(
         batcher: Batcher,
         cb: F,
+        backoff: B,
         main_rx: mpsc::Receiver<Item<T>>,
         error_tx: Option<mpsc::Sender<E>>,
     ) -> Self {
         Self {
             cb,
+            backoff,
             main_rx,
             error_tx,
             batcher,
@@ -278,8 +297,8 @@ where
 
             match (self.cb)(msgs).await {
                 Ok(ops) => ops.iter().for_each(|retry| {
-                    if let Some(item) = msg_map.get(&retry.id()) {
-                        self.retry_q.insert(item.retry(), retry.duration());
+                    if let Some(item) = msg_map.get(&retry.0) {
+                        self.retry_q.insert(item.retry(), self.backoff.next());
                     }
                 }),
                 Err(e) => {
