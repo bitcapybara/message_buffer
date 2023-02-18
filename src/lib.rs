@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{future::Future, mem, time::Duration};
 
 use futures::StreamExt;
 use tokio::{
@@ -153,8 +153,8 @@ struct MessageBuffer<T: Clone, E> {
 impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
     fn with_capacity<F, Fut, B>(cb: F, backoff: B, options: Options) -> Self
     where
-        F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Vec<Retry>, E>> + Send + 'static,
+        F: Fn(&mut Messages<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
         B: BackOff + Send + 'static,
     {
         let (main_tx, main_rx) = mpsc::channel(options.cap);
@@ -206,7 +206,7 @@ struct Item<T: Clone> {
 }
 
 impl<T: Clone> Item<T> {
-    fn retry(&self) -> Self {
+    fn retry(self) -> Self {
         Self {
             id: self.id,
             data: self.data.clone(),
@@ -267,10 +267,33 @@ impl BackOff for ExponentBackOff {
     }
 }
 
+struct Messages<T: Clone> {
+    msgs: Vec<Item<T>>,
+    retries: Vec<Item<T>>,
+}
+
+impl<T: Clone> Messages<T> {
+    fn all(&mut self) -> Vec<Item<T>> {
+        mem::take(&mut self.msgs)
+    }
+    fn retry(&mut self, msg: &Item<T>) {
+        self.retries.push(msg.clone());
+    }
+}
+
+impl<T: Clone> From<Vec<Item<T>>> for Messages<T> {
+    fn from(msgs: Vec<Item<T>>) -> Self {
+        Self {
+            msgs,
+            retries: Vec::new(),
+        }
+    }
+}
+
 struct Worker<F, Fut, T, E, B>
 where
-    F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Vec<Retry>, E>> + Send + 'static,
+    F: Fn(&mut Messages<T>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), E>> + Send + 'static,
     T: Clone,
     E: Send + 'static,
     B: BackOff + Send + 'static,
@@ -285,8 +308,8 @@ where
 
 impl<F, Fut, T, E, B> Worker<F, Fut, T, E, B>
 where
-    F: Fn(Vec<Item<T>>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Vec<Retry>, E>> + Send + 'static,
+    F: Fn(&mut Messages<T>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), E>> + Send + 'static,
     T: Clone,
     E: Send + 'static,
     B: BackOff + Send + 'static,
@@ -309,22 +332,16 @@ where
     }
 
     async fn start(mut self) -> Result<(), MessageBufferError> {
-        // store msgs for retry query
-        let mut msg_map = HashMap::new();
         loop {
-            let msgs = self
+            let mut msgs: Messages<T> = self
                 .batcher
                 .poll(&mut self.main_rx, &mut self.retry_q)
-                .await?;
-            for msg in msgs.iter() {
-                msg_map.insert(msg.id, msg.clone());
-            }
+                .await?
+                .into();
 
-            match (self.cb)(msgs).await {
-                Ok(ops) => ops.iter().for_each(|retry| {
-                    if let Some(item) = msg_map.get(&retry.0) {
-                        self.retry_q.insert(item.retry(), self.backoff.next());
-                    }
+            match (self.cb)(&mut msgs).await {
+                Ok(_) => msgs.retries.into_iter().for_each(|item| {
+                    self.retry_q.insert(item.retry(), self.backoff.next());
                 }),
                 Err(e) => {
                     if let Some(e_tx) = &self.error_tx {
@@ -332,8 +349,6 @@ where
                     }
                 }
             }
-            // clear map for next loop use
-            msg_map.clear();
         }
     }
 }
