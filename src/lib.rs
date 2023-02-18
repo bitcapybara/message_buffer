@@ -11,7 +11,7 @@ use tokio::{
 };
 use tokio_util::time::DelayQueue;
 
-enum MessageBufferError {
+pub enum MessageBufferError {
     QueueFull,
     Stopped,
 }
@@ -25,13 +25,19 @@ impl<T> From<TrySendError<T>> for MessageBufferError {
     }
 }
 
-struct Batch {
+pub trait Processor<T: Clone, E> {
+    type Future: Future<Output = Result<(), E>>;
+
+    fn call(&mut self, msgs: &mut Messages<T>) -> Self::Future;
+}
+
+pub struct Batch {
     batch_size: usize,
     timeout: Duration,
 }
 
 impl Batch {
-    fn new(batch_size: usize, timeout: Duration) -> Self {
+    pub fn new(batch_size: usize, timeout: Duration) -> Self {
         Self {
             batch_size,
             timeout,
@@ -96,14 +102,14 @@ impl Batcher {
     }
 }
 
-struct Options {
+pub struct Options {
     batcher: Batcher,
     rcv_err: bool,
     cap: usize,
 }
 
 impl Options {
-    fn builder() -> OptionsBuilder {
+    pub fn builder() -> OptionsBuilder {
         OptionsBuilder {
             batch: None,
             rcv_err: false,
@@ -112,29 +118,39 @@ impl Options {
     }
 }
 
-struct OptionsBuilder {
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            batcher: Batcher(None),
+            rcv_err: false,
+            cap: 1024,
+        }
+    }
+}
+
+pub struct OptionsBuilder {
     batch: Option<Batch>,
     rcv_err: bool,
     cap: usize,
 }
 
 impl OptionsBuilder {
-    fn batch(mut self, batch_size: usize, timeout: Duration) -> Self {
+    pub fn batch(mut self, batch_size: usize, timeout: Duration) -> Self {
         self.batch = Some(Batch::new(batch_size, timeout));
         self
     }
 
-    fn need_recv_error(mut self) -> Self {
+    pub fn need_recv_error(mut self) -> Self {
         self.rcv_err = true;
         self
     }
 
-    fn capacity(mut self, cap: usize) -> Self {
+    pub fn capacity(mut self, cap: usize) -> Self {
         self.cap = cap;
         self
     }
 
-    fn build(self) -> Options {
+    pub fn build(self) -> Options {
         Options {
             batcher: Batcher(self.batch),
             rcv_err: self.rcv_err,
@@ -143,18 +159,22 @@ impl OptionsBuilder {
     }
 }
 
-struct MessageBuffer<T: Clone, E> {
+pub struct MessageBuffer<T: Clone, E> {
     id_gen: usize,
     main_tx: mpsc::Sender<Item<T>>,
     error_rx: Option<mpsc::Receiver<E>>,
     handle: JoinHandle<Result<(), MessageBufferError>>,
 }
 
-impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
-    fn with_capacity<F, Fut, B>(cb: F, backoff: B, options: Options) -> Self
+impl<T, E> MessageBuffer<T, E>
+where
+    T: Clone + Send + 'static,
+    E: Send + 'static,
+{
+    pub fn new<P, B>(processor: P, backoff: B, options: Options) -> Self
     where
-        F: Fn(&mut Messages<T>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        P: Processor<T, E> + Send + Sync + 'static,
+        P::Future: Send + 'static,
         B: BackOff + Send + 'static,
     {
         let (main_tx, main_rx) = mpsc::channel(options.cap);
@@ -166,7 +186,7 @@ impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
         }
 
         // start worker
-        let worker = Worker::new(options.batcher, cb, backoff, main_rx, error_tx);
+        let worker = Worker::new(options.batcher, processor, backoff, main_rx, error_tx);
         let handle = tokio::spawn(worker.start());
 
         Self {
@@ -177,7 +197,7 @@ impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
         }
     }
 
-    async fn push(&mut self, msg: T) -> Result<(), MessageBufferError> {
+    pub async fn push(&mut self, msg: T) -> Result<(), MessageBufferError> {
         self.id_gen += 1;
         Ok(self.main_tx.try_send(Item {
             id: self.id_gen,
@@ -186,11 +206,11 @@ impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
         })?)
     }
 
-    async fn error_receiver(&mut self) -> Option<mpsc::Receiver<E>> {
+    pub async fn error_receiver(&mut self) -> Option<mpsc::Receiver<E>> {
         self.error_rx.take()
     }
 
-    async fn stop(self) {
+    pub async fn stop(self) {
         drop(self.main_tx);
         let _ = self.handle.await;
     }
@@ -199,14 +219,14 @@ impl<T: Clone + Send + 'static, E: Send + 'static> MessageBuffer<T, E> {
 /// msg and exec count
 /// 0 for new msg
 #[derive(Clone)]
-struct Item<T: Clone> {
+pub struct Item<T: Clone> {
     id: usize,
     data: T,
     trys: usize,
 }
 
 impl<T: Clone> Item<T> {
-    fn retry(self) -> Self {
+    pub fn retry(self) -> Self {
         Self {
             id: self.id,
             data: self.data.clone(),
@@ -219,14 +239,14 @@ impl<T: Clone> Item<T> {
 /// duration to delay
 pub struct Retry(usize);
 
-trait BackOff {
+pub trait BackOff {
     fn next(&mut self) -> Duration;
 }
 
-struct ConstantBackOff(Duration);
+pub struct ConstantBackOff(Duration);
 
 impl ConstantBackOff {
-    fn new(duration: Duration) -> Self {
+    pub fn new(duration: Duration) -> Self {
         Self(duration)
     }
 }
@@ -237,7 +257,7 @@ impl BackOff for ConstantBackOff {
     }
 }
 
-struct ExponentBackOff {
+pub struct ExponentBackOff {
     /// used to calculate next duration
     current: Duration,
     /// must greater than 1
@@ -247,7 +267,7 @@ struct ExponentBackOff {
 }
 
 impl ExponentBackOff {
-    fn new(init: Duration, factor: u32, max: Duration) -> Self {
+    pub fn new(init: Duration, factor: u32, max: Duration) -> Self {
         Self {
             current: init,
             factor,
@@ -267,16 +287,16 @@ impl BackOff for ExponentBackOff {
     }
 }
 
-struct Messages<T: Clone> {
+pub struct Messages<T: Clone> {
     msgs: Vec<Item<T>>,
     retries: Vec<Item<T>>,
 }
 
 impl<T: Clone> Messages<T> {
-    fn all(&mut self) -> Vec<Item<T>> {
+    pub fn all(&mut self) -> Vec<Item<T>> {
         mem::take(&mut self.msgs)
     }
-    fn retry(&mut self, msg: &Item<T>) {
+    pub fn retry(&mut self, msg: &Item<T>) {
         self.retries.push(msg.clone());
     }
 }
@@ -290,15 +310,14 @@ impl<T: Clone> From<Vec<Item<T>>> for Messages<T> {
     }
 }
 
-struct Worker<F, Fut, T, E, B>
+struct Worker<P, T, E, B>
 where
-    F: Fn(&mut Messages<T>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<(), E>> + Send + 'static,
+    P: Processor<T, E> + Send + Sync + 'static,
     T: Clone,
     E: Send + 'static,
     B: BackOff + Send + 'static,
 {
-    cb: F,
+    processor: P,
     backoff: B,
     main_rx: mpsc::Receiver<Item<T>>,
     error_tx: Option<mpsc::Sender<E>>,
@@ -306,23 +325,23 @@ where
     retry_q: DelayQueue<Item<T>>,
 }
 
-impl<F, Fut, T, E, B> Worker<F, Fut, T, E, B>
+impl<P, T, E, B> Worker<P, T, E, B>
 where
-    F: Fn(&mut Messages<T>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<(), E>> + Send + 'static,
+    P: Processor<T, E> + Send + Sync + 'static,
+    P::Future: Send + 'static,
     T: Clone,
     E: Send + 'static,
     B: BackOff + Send + 'static,
 {
     fn new(
         batcher: Batcher,
-        cb: F,
+        processor: P,
         backoff: B,
         main_rx: mpsc::Receiver<Item<T>>,
         error_tx: Option<mpsc::Sender<E>>,
     ) -> Self {
         Self {
-            cb,
+            processor,
             backoff,
             main_rx,
             error_tx,
@@ -339,7 +358,7 @@ where
                 .await?
                 .into();
 
-            match (self.cb)(&mut msgs).await {
+            match self.processor.call(&mut msgs).await {
                 Ok(_) => msgs.retries.into_iter().for_each(|item| {
                     self.retry_q.insert(item.retry(), self.backoff.next());
                 }),

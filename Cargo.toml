@@ -1,5 +1,5 @@
 [package]
-name = "rs_demo"
+name = "message_buffer"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,3 +7,4 @@ edition = "2021"
 futures = "0.3.26"
 tokio = { version = "1.25.0", features = ["rt", "sync", "time", "macros"] }
 tokio-util = { version = "0.7.6", features = ["time"] }
+
