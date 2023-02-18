@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{future::Future, mem, sync::Arc, time::Duration};
+use std::{future::Future, mem, time::Duration};
 
 use futures::StreamExt;
 use tokio::{
@@ -26,9 +26,9 @@ impl<T> From<TrySendError<T>> for MessageBufferError {
 }
 
 pub trait Processor<T: Clone, E> {
-    type Future: Future<Output = Result<(), E>>;
+    type Future: Future<Output = Result<Vec<Item<T>>, E>>;
 
-    fn call(&mut self, msgs: &mut Messages<T>) -> Self::Future;
+    fn call(&mut self, msgs: Messages<T>) -> Self::Future;
 }
 
 pub fn service_fn<F>(f: F) -> ServiceFn<F> {
@@ -42,12 +42,12 @@ pub struct ServiceFn<F> {
 impl<T, Fut, F, E> Processor<T, E> for ServiceFn<F>
 where
     T: Clone,
-    F: Fn(&mut Messages<T>) -> Fut,
-    Fut: Future<Output = Result<(), E>>,
+    F: Fn(Messages<T>) -> Fut,
+    Fut: Future<Output = Result<Vec<Item<T>>, E>>,
 {
     type Future = Fut;
 
-    fn call(&mut self, msgs: &mut Messages<T>) -> Self::Future {
+    fn call(&mut self, msgs: Messages<T>) -> Self::Future {
         (self.f)(msgs)
     }
 }
@@ -247,7 +247,7 @@ pub struct Item<T: Clone> {
 }
 
 impl<T: Clone> Item<T> {
-    pub fn retry(self) -> Self {
+    fn retry(self) -> Self {
         Self {
             id: self.id,
             data: self.data,
@@ -317,11 +317,14 @@ pub struct Messages<T: Clone> {
 }
 
 impl<T: Clone> Messages<T> {
-    pub fn all(&mut self) -> Vec<Item<T>> {
+    pub fn msgs(&mut self) -> Vec<Item<T>> {
         mem::take(&mut self.msgs)
     }
     pub fn retry(&mut self, msg: &Item<T>) {
         self.retries.push(msg.clone());
+    }
+    pub fn retries(mut self) -> Vec<Item<T>> {
+        mem::take(&mut self.retries)
     }
 }
 
@@ -334,14 +337,7 @@ impl<T: Clone> From<Vec<Item<T>>> for Messages<T> {
     }
 }
 
-struct Worker<P, T, E, B>
-where
-    P: Processor<T, E> + Send + Sync + 'static,
-    P::Future: Send + 'static,
-    T: Clone,
-    E: Send + 'static,
-    B: BackOff + Send + 'static,
-{
+struct Worker<P, T: Clone, E, B> {
     processor: P,
     backoff: B,
     main_rx: mpsc::Receiver<Item<T>>,
@@ -354,7 +350,7 @@ impl<P, T, E, B> Worker<P, T, E, B>
 where
     P: Processor<T, E> + Send + Sync + 'static,
     P::Future: Send + 'static,
-    T: Clone,
+    T: Clone + 'static,
     E: Send + 'static,
     B: BackOff + Send + 'static,
 {
@@ -377,14 +373,14 @@ where
 
     async fn start(mut self) -> Result<(), MessageBufferError> {
         loop {
-            let mut msgs: Messages<T> = self
+            let msgs = self
                 .batcher
                 .poll(&mut self.main_rx, &mut self.retry_q)
                 .await?
                 .into();
 
-            match self.processor.call(&mut msgs).await {
-                Ok(_) => msgs.retries.into_iter().for_each(|item| {
+            match self.processor.call(msgs).await {
+                Ok(retries) => retries.into_iter().for_each(|item| {
                     self.retry_q.insert(item.retry(), self.backoff.next());
                 }),
                 Err(e) => {
