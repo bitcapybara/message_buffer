@@ -225,20 +225,45 @@ trait BackOff {
 
 struct ConstantBackOff(Duration);
 
+impl ConstantBackOff {
+    fn new(duration: Duration) -> Self {
+        Self(duration)
+    }
+}
+
 impl BackOff for ConstantBackOff {
     fn next(&mut self) -> Duration {
-        todo!()
+        self.0
     }
 }
 
 struct ExponentBackOff {
-    factor: usize,
+    /// used to calculate next duration
+    current: Duration,
+    /// must greater than 1
+    factor: u32,
+    /// max duration boundary
     max: Duration,
+}
+
+impl ExponentBackOff {
+    fn new(init: Duration, factor: u32, max: Duration) -> Self {
+        Self {
+            current: init,
+            factor,
+            max,
+        }
+    }
 }
 
 impl BackOff for ExponentBackOff {
     fn next(&mut self) -> Duration {
-        todo!()
+        let mut next = self.current * self.factor;
+        if next > self.max {
+            next = self.max;
+        }
+        self.current = next;
+        next
     }
 }
 
