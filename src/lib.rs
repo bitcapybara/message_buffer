@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{future::Future, mem, time::Duration};
+use std::{future::Future, mem, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use tokio::{
@@ -29,6 +29,27 @@ pub trait Processor<T: Clone, E> {
     type Future: Future<Output = Result<(), E>>;
 
     fn call(&mut self, msgs: &mut Messages<T>) -> Self::Future;
+}
+
+pub fn service_fn<F>(f: F) -> ServiceFn<F> {
+    ServiceFn { f }
+}
+
+pub struct ServiceFn<F> {
+    f: F,
+}
+
+impl<T, Fut, F, E> Processor<T, E> for ServiceFn<F>
+where
+    T: Clone,
+    F: Fn(&mut Messages<T>) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    type Future = Fut;
+
+    fn call(&mut self, msgs: &mut Messages<T>) -> Self::Future {
+        (self.f)(msgs)
+    }
 }
 
 pub struct Batch {
@@ -186,7 +207,7 @@ where
         }
 
         // start worker
-        let worker = Worker::new(options.batcher, processor, backoff, main_rx, error_tx);
+        let worker = Worker::new(processor, options.batcher, backoff, main_rx, error_tx);
         let handle = tokio::spawn(worker.start());
 
         Self {
@@ -229,7 +250,7 @@ impl<T: Clone> Item<T> {
     pub fn retry(self) -> Self {
         Self {
             id: self.id,
-            data: self.data.clone(),
+            data: self.data,
             trys: self.trys + 1,
         }
     }
@@ -267,7 +288,10 @@ pub struct ExponentBackOff {
 }
 
 impl ExponentBackOff {
-    pub fn new(init: Duration, factor: u32, max: Duration) -> Self {
+    pub fn new(init: Duration, mut factor: u32, max: Duration) -> Self {
+        if factor <= 1 {
+            factor = 2;
+        }
         Self {
             current: init,
             factor,
@@ -313,6 +337,7 @@ impl<T: Clone> From<Vec<Item<T>>> for Messages<T> {
 struct Worker<P, T, E, B>
 where
     P: Processor<T, E> + Send + Sync + 'static,
+    P::Future: Send + 'static,
     T: Clone,
     E: Send + 'static,
     B: BackOff + Send + 'static,
@@ -334,8 +359,8 @@ where
     B: BackOff + Send + 'static,
 {
     fn new(
-        batcher: Batcher,
         processor: P,
+        batcher: Batcher,
         backoff: B,
         main_rx: mpsc::Receiver<Item<T>>,
         error_tx: Option<mpsc::Sender<E>>,
