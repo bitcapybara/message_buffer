@@ -1,15 +1,18 @@
 #![allow(dead_code)]
 
-use std::{error::Error, fmt::Display, future::Future, mem, time::Duration};
+use std::{error::Error, fmt::Display, future::Future, mem, task::Poll, time::Duration};
 
-use futures::StreamExt;
+use futures::{stream::select_all, Stream, StreamExt};
 use tokio::{
     select,
-    sync::mpsc::{self, error::TrySendError},
+    sync::{
+        mpsc::error::SendError,
+        mpsc::{self, error::TrySendError},
+    },
     task::JoinHandle,
     time::timeout,
 };
-use tokio_util::time::DelayQueue;
+use tokio_util::time::{delay_queue::Expired, DelayQueue};
 
 #[derive(Debug)]
 pub enum MessageBufferError {
@@ -37,8 +40,14 @@ impl<T> From<TrySendError<T>> for MessageBufferError {
     }
 }
 
-pub trait Processor<T: Clone, E> {
-    type Future: Future<Output = Result<Vec<Item<T>>, E>>;
+impl<T: Clone + Send> From<SendError<Item<T>>> for MessageBufferError {
+    fn from(_: SendError<Item<T>>) -> Self {
+        Self::Stopped
+    }
+}
+
+pub trait Processor<T: Clone + Send, E> {
+    type Future: Future<Output = Result<(), E>>;
 
     fn call(&mut self, msgs: Messages<T>) -> Self::Future;
 }
@@ -53,9 +62,9 @@ pub struct ServiceFn<F> {
 
 impl<T, Fut, F, E> Processor<T, E> for ServiceFn<F>
 where
-    T: Clone,
+    T: Clone + Send,
     F: Fn(Messages<T>) -> Fut,
-    Fut: Future<Output = Result<Vec<Item<T>>, E>>,
+    Fut: Future<Output = Result<(), E>>,
 {
     type Future = Fut;
 
@@ -64,6 +73,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct Batch {
     batch_size: usize,
     timeout: Duration,
@@ -79,15 +89,16 @@ impl Batch {
 }
 
 /// batch setting
+#[derive(Debug)]
 struct Batcher(Option<Batch>);
 
 impl Batcher {
     /// if timeout elapsed, return Ok(Vec), vec may be empty
     /// if queue closed, return Err(Stopped)
-    async fn poll<T: Clone>(
+    async fn poll<T: Clone + Send>(
         &self,
         main_rx: &mut mpsc::Receiver<Item<T>>,
-        retry_q: &mut DelayQueue<Item<T>>,
+        retry_q: &mut mpsc::Receiver<Item<T>>,
     ) -> Result<Vec<Item<T>>, MessageBufferError> {
         match self.0 {
             Some(Batch {
@@ -98,25 +109,32 @@ impl Batcher {
         }
     }
 
-    async fn poll_one<T: Clone>(
+    async fn poll_one<T: Clone + Send>(
         main_rx: &mut mpsc::Receiver<Item<T>>,
-        retry_q: &mut DelayQueue<Item<T>>,
+        retry_q: &mut mpsc::Receiver<Item<T>>,
     ) -> Result<Item<T>, MessageBufferError> {
+        println!("poll one");
         select! {
             msg_res = main_rx.recv() => {
+                println!("main_rx recved");
                 msg_res.ok_or(MessageBufferError::Stopped)
             }
-            ex_res = retry_q.next() => {
-                ex_res.map(|e| e.into_inner()).ok_or(MessageBufferError::Stopped)
+            ex_res = retry_q.recv() => {
+                println!("retry_q recved");
+                ex_res.ok_or(MessageBufferError::Stopped)
+            }
+            else => {
+                println!("poll is empty");
+                unreachable!()
             }
         }
     }
 
-    async fn poll_batch<T: Clone>(
+    async fn poll_batch<T: Clone + Send>(
         bsz: usize,
         tmot: Duration,
         main_rx: &mut mpsc::Receiver<Item<T>>,
-        retry_q: &mut DelayQueue<Item<T>>,
+        retry_q: &mut mpsc::Receiver<Item<T>>,
     ) -> Result<Vec<Item<T>>, MessageBufferError> {
         let mut msgs = Vec::with_capacity(bsz);
         match timeout(tmot, async {
@@ -135,6 +153,7 @@ impl Batcher {
     }
 }
 
+#[derive(Debug)]
 pub struct Options {
     batcher: Batcher,
     rcv_err: bool,
@@ -192,8 +211,7 @@ impl OptionsBuilder {
     }
 }
 
-pub struct MessageBuffer<T: Clone, E> {
-    id_gen: usize,
+pub struct MessageBuffer<T: Clone + Send, E> {
     main_tx: mpsc::Sender<Item<T>>,
     error_rx: Option<mpsc::Receiver<E>>,
     handle: JoinHandle<Result<(), MessageBufferError>>,
@@ -210,6 +228,7 @@ where
         P::Future: Send + 'static,
         B: BackOff + Send + 'static,
     {
+        println!("options {:?}", options);
         let (main_tx, main_rx) = mpsc::channel(options.cap);
         let (mut error_tx, mut error_rx) = (None, None);
         if options.rcv_err {
@@ -220,10 +239,15 @@ where
 
         // start worker
         let worker = Worker::new(processor, options.batcher, backoff, main_rx, error_tx);
-        let handle = tokio::spawn(worker.start());
+        let handle = tokio::spawn(async move {
+            if let Err(e) = worker.start().await {
+                println!("worker exit... {e}");
+                return Err(e);
+            }
+            Ok(())
+        });
 
         Self {
-            id_gen: 0,
             main_tx,
             handle,
             error_rx,
@@ -231,12 +255,7 @@ where
     }
 
     pub async fn push(&mut self, msg: T) -> Result<(), MessageBufferError> {
-        self.id_gen += 1;
-        Ok(self.main_tx.try_send(Item {
-            id: self.id_gen,
-            data: msg,
-            trys: 0,
-        })?)
+        Ok(self.main_tx.send(Item { data: msg, trys: 0 }).await?)
     }
 
     pub async fn error_receiver(&mut self) -> Option<mpsc::Receiver<E>> {
@@ -252,25 +271,19 @@ where
 /// msg and exec count
 /// 0 for new msg
 #[derive(Clone)]
-pub struct Item<T: Clone> {
-    pub id: usize,
+pub struct Item<T: Clone + Send + Send> {
     pub data: T,
     pub trys: usize,
 }
 
-impl<T: Clone> Item<T> {
+impl<T: Clone + Send + Send> Item<T> {
     fn retry(self) -> Self {
         Self {
-            id: self.id,
             data: self.data,
             trys: self.trys + 1,
         }
     }
 }
-
-/// send msg to retry queue
-/// duration to delay
-pub struct Retry(usize);
 
 pub trait BackOff {
     fn next(&mut self) -> Duration;
@@ -323,46 +336,53 @@ impl BackOff for ExponentBackOff {
     }
 }
 
-pub struct Messages<T: Clone> {
+pub struct Messages<T: Clone + Send> {
     msgs: Vec<Item<T>>,
-    retries: Vec<Item<T>>,
+    retry_tx: mpsc::Sender<Item<T>>,
 }
 
-impl<T: Clone> Messages<T> {
+impl<T: Clone + Send> Messages<T> {
+    fn new(msgs: Vec<Item<T>>, retry_tx: mpsc::Sender<Item<T>>) -> Self {
+        Self { msgs, retry_tx }
+    }
     pub fn msgs(&mut self) -> Vec<Item<T>> {
         mem::take(&mut self.msgs)
     }
-    pub fn retry(&mut self, msg: &Item<T>) {
-        self.retries.push(msg.clone());
-    }
-    pub fn retries(mut self) -> Vec<Item<T>> {
-        mem::take(&mut self.retries)
+    pub async fn retry(&mut self, msg: &Item<T>) -> Result<(), MessageBufferError> {
+        Ok(self.retry_tx.send(msg.clone()).await?)
     }
 }
 
-impl<T: Clone> From<Vec<Item<T>>> for Messages<T> {
-    fn from(msgs: Vec<Item<T>>) -> Self {
-        Self {
-            msgs,
-            retries: Vec::new(),
+struct RetryQueue<T>(DelayQueue<T>);
+
+impl<T> Stream for RetryQueue<T> {
+    type Item = T;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match DelayQueue::poll_expired(&mut self.get_mut().0, cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item.into_inner())),
+            Poll::Ready(None) | Poll::Pending => Poll::Pending,
         }
     }
 }
 
-struct Worker<P, T: Clone, E, B> {
+struct Worker<P, T: Clone + Send + Send, E, B> {
     processor: P,
     backoff: B,
     main_rx: mpsc::Receiver<Item<T>>,
     error_tx: Option<mpsc::Sender<E>>,
     batcher: Batcher,
-    retry_q: DelayQueue<Item<T>>,
+    retry_q: RetryQueue<Item<T>>,
 }
 
 impl<P, T, E, B> Worker<P, T, E, B>
 where
     P: Processor<T, E> + Send + Sync + 'static,
     P::Future: Send + 'static,
-    T: Clone + 'static,
+    T: Clone + Send + Send + 'static,
     E: Send + 'static,
     B: BackOff + Send + 'static,
 {
@@ -379,26 +399,52 @@ where
             main_rx,
             error_tx,
             batcher,
-            retry_q: DelayQueue::new(),
+            retry_q: RetryQueue(DelayQueue::new()),
         }
     }
 
     async fn start(mut self) -> Result<(), MessageBufferError> {
-        loop {
-            let msgs = self
-                .batcher
-                .poll(&mut self.main_rx, &mut self.retry_q)
-                .await?
-                .into();
-
-            match self.processor.call(msgs).await {
-                Ok(retries) => retries.into_iter().for_each(|item| {
-                    self.retry_q.insert(item.retry(), self.backoff.next());
-                }),
-                Err(e) => {
-                    if let Some(e_tx) = &self.error_tx {
-                        let _ = e_tx.try_send(e);
+        let (retry_tx, mut retry_rx) = mpsc::channel::<Item<T>>(1);
+        let (retry_q_tx, mut retry_q_rx) = mpsc::channel::<Item<T>>(1);
+        tokio::spawn(async move {
+            loop {
+                select! {
+                    retry_q_res = self.retry_q.next() => {
+                        if let  Some(item) = retry_q_res {
+                            if let Err(e) = retry_q_tx.send(item).await {
+                                println!("retry_q_tx send err: {e}");
+                            }
+                            println!("retry_q_tx added")
+                        } else {
+                            println!("retry_q empty")
+                        }
                     }
+                    retry_rx_res = retry_rx.recv() => {
+                        match retry_rx_res {
+                            Some(item) => {
+                                println!("retry_q added");
+                                self.retry_q.0.insert(item.retry(), self.backoff.next());
+                            }
+                            None => {
+                                println!("retry_rx dropped");
+                                return;
+                            },
+                        }
+                    }
+                }
+            }
+        });
+        loop {
+            println!("start poll");
+            let poll_msgs = self
+                .batcher
+                .poll(&mut self.main_rx, &mut retry_q_rx)
+                .await?;
+            println!("end poll");
+            let msgs = Messages::new(poll_msgs, retry_tx.clone());
+            if let Err(e) = self.processor.call(msgs).await {
+                if let Some(e_tx) = &self.error_tx {
+                    let _ = e_tx.try_send(e);
                 }
             }
         }
