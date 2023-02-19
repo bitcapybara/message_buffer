@@ -2,7 +2,7 @@
 
 use std::{error::Error, fmt::Display, future::Future, mem, task::Poll, time::Duration};
 
-use futures::{stream::select_all, Stream, StreamExt};
+use futures::{future, FutureExt, Stream, StreamExt};
 use tokio::{
     select,
     sync::{
@@ -12,7 +12,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
-use tokio_util::time::{delay_queue::Expired, DelayQueue};
+use tokio_util::time::DelayQueue;
 
 #[derive(Debug)]
 pub enum MessageBufferError {
@@ -355,6 +355,12 @@ impl<T: Clone + Send> Messages<T> {
 
 struct RetryQueue<T>(DelayQueue<T>);
 
+impl<T> RetryQueue<T> {
+    fn insert(&mut self, value: T, timeout: Duration) {
+        self.0.insert(value, timeout);
+    }
+}
+
 impl<T> Stream for RetryQueue<T> {
     type Item = T;
 
@@ -403,47 +409,76 @@ where
         }
     }
 
-    async fn start(mut self) -> Result<(), MessageBufferError> {
-        let (retry_tx, mut retry_rx) = mpsc::channel::<Item<T>>(1);
-        let (retry_q_tx, mut retry_q_rx) = mpsc::channel::<Item<T>>(1);
-        tokio::spawn(async move {
-            loop {
-                select! {
-                    retry_q_res = self.retry_q.next() => {
-                        if let  Some(item) = retry_q_res {
-                            if let Err(e) = retry_q_tx.send(item).await {
-                                println!("retry_q_tx send err: {e}");
-                            }
-                            println!("retry_q_tx added")
-                        } else {
-                            println!("retry_q empty")
-                        }
+    async fn start(self) -> Result<(), MessageBufferError> {
+        let (retry_tx, retry_rx) = mpsc::channel::<Item<T>>(1);
+        let (retry_q_tx, retry_q_rx) = mpsc::channel::<Item<T>>(1);
+
+        // retry loop task
+        let (retry_task, retry_handle) =
+            Self::retry_loop(self.retry_q, self.backoff, retry_q_tx, retry_rx).remote_handle();
+        tokio::spawn(retry_task);
+
+        // process loop task
+        let (process_task, process_handle) = Self::process_loop(
+            self.batcher,
+            self.processor,
+            self.error_tx,
+            self.main_rx,
+            retry_tx,
+            retry_q_rx,
+        )
+        .remote_handle();
+        tokio::spawn(process_task);
+
+        future::try_join(retry_handle, process_handle).await?;
+        Ok(())
+    }
+
+    async fn retry_loop(
+        mut retry_q: RetryQueue<Item<T>>,
+        mut backoff: B,
+        retry_q_tx: mpsc::Sender<Item<T>>,
+        mut retry_rx: mpsc::Receiver<Item<T>>,
+    ) -> Result<(), MessageBufferError> {
+        loop {
+            select! {
+                retry_q_res = retry_q.next() => {
+                    if let  Some(item) = retry_q_res {
+                        retry_q_tx.send(item).await?;
+                        println!("retry_q_tx added")
                     }
-                    retry_rx_res = retry_rx.recv() => {
-                        match retry_rx_res {
-                            Some(item) => {
-                                println!("retry_q added");
-                                self.retry_q.0.insert(item.retry(), self.backoff.next());
-                            }
-                            None => {
-                                println!("retry_rx dropped");
-                                return;
-                            },
+                }
+                retry_rx_res = retry_rx.recv() => {
+                    match retry_rx_res {
+                        Some(item) => {
+                            println!("retry_q added");
+                            retry_q.insert(item.retry(), backoff.next());
                         }
+                        None => {
+                            println!("retry_rx dropped");
+                            return Err(MessageBufferError::Stopped);
+                        },
                     }
                 }
             }
-        });
+        }
+    }
+
+    async fn process_loop(
+        batcher: Batcher,
+        mut processor: P,
+        error_tx: Option<mpsc::Sender<E>>,
+        mut main_rx: mpsc::Receiver<Item<T>>,
+        retry_tx: mpsc::Sender<Item<T>>,
+        mut retry_q_rx: mpsc::Receiver<Item<T>>,
+    ) -> Result<(), MessageBufferError> {
         loop {
             println!("start poll");
-            let poll_msgs = self
-                .batcher
-                .poll(&mut self.main_rx, &mut retry_q_rx)
-                .await?;
+            let poll_msgs = batcher.poll(&mut main_rx, &mut retry_q_rx).await?;
             println!("end poll");
             let msgs = Messages::new(poll_msgs, retry_tx.clone());
-            if let Err(e) = self.processor.call(msgs).await {
-                if let Some(e_tx) = &self.error_tx {
+            if let Err(e) = processor.call(msgs).await {
+                if let Some(e_tx) = &error_tx {
                     let _ = e_tx.try_send(e);
                 }
             }
