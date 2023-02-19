@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{future::Future, mem, time::Duration};
+use std::{error::Error, fmt::Display, future::Future, mem, time::Duration};
 
 use futures::StreamExt;
 use tokio::{
@@ -11,9 +11,21 @@ use tokio::{
 };
 use tokio_util::time::DelayQueue;
 
+#[derive(Debug)]
 pub enum MessageBufferError {
     QueueFull,
     Stopped,
+}
+
+impl Error for MessageBufferError {}
+
+impl Display for MessageBufferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => write!(f, "Message buffer queue is full"),
+            Self::Stopped => write!(f, "Message buffer already stopped"),
+        }
+    }
 }
 
 impl<T> From<TrySendError<T>> for MessageBufferError {
@@ -241,9 +253,9 @@ where
 /// 0 for new msg
 #[derive(Clone)]
 pub struct Item<T: Clone> {
-    id: usize,
-    data: T,
-    trys: usize,
+    pub id: usize,
+    pub data: T,
+    pub trys: usize,
 }
 
 impl<T: Clone> Item<T> {
