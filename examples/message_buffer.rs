@@ -10,6 +10,7 @@ async fn main() -> anyhow::Result<()> {
         ConstantBackOff::new(Duration::from_secs(1)),
         Options::default(),
     );
+    mb.start();
     for i in 0..10 {
         println!("=========");
         if let Err(e) = mb.push(i).await {
@@ -18,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
         println!("pushed");
         time::sleep(Duration::from_secs(1)).await;
     }
-    mb.stop().await;
+    mb.stop().await?;
     Ok(())
 }
 
