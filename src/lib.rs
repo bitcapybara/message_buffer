@@ -54,15 +54,15 @@ pub trait Processor<T: Clone + Send, E> {
     fn call(&mut self, msgs: Messages<T>) -> Self::Future;
 }
 
-pub fn service_fn<F>(f: F) -> ServiceFn<F> {
-    ServiceFn { f }
+pub fn processor_fn<F>(f: F) -> ProcessorFn<F> {
+    ProcessorFn { f }
 }
 
-pub struct ServiceFn<F> {
+pub struct ProcessorFn<F> {
     f: F,
 }
 
-impl<T, Fut, F, E> Processor<T, E> for ServiceFn<F>
+impl<T, Fut, F, E> Processor<T, E> for ProcessorFn<F>
 where
     T: Clone + Send,
     F: Fn(Messages<T>) -> Fut,

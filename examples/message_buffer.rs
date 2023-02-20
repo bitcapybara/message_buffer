@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use message_buffer::{service_fn, ConstantBackOff, MessageBuffer, Messages, Options};
+use message_buffer::{processor_fn, ConstantBackOff, MessageBuffer, Messages, Options};
 use tokio::time;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut mb = MessageBuffer::new(
-        service_fn(process),
+        processor_fn(process),
         ConstantBackOff::new(Duration::from_secs(1)),
         Options::default(),
     );
