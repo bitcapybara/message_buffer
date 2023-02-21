@@ -30,7 +30,7 @@ async fn process(mut m: Messages<usize>) -> Result<(), String> {
         if msg.trys > 1 {
             continue;
         }
-        if let Err(e) = m.retry(&msg).await {
+        if let Err(e) = m.add_retry(&msg).await {
             println!("process retry err: {e}")
         }
         println!("send retry");

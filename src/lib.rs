@@ -10,7 +10,10 @@ use tokio::{
     select,
     sync::{
         mpsc::error::SendError,
-        mpsc::{self, error::TrySendError},
+        mpsc::{
+            self,
+            error::{TryRecvError::Disconnected, TryRecvError::Empty},
+        },
     },
     time::timeout,
 };
@@ -29,15 +32,6 @@ impl Display for MessageBufferError {
         match self {
             Self::QueueFull => write!(f, "Message buffer queue is full"),
             Self::Stopped => write!(f, "Message buffer already stopped"),
-        }
-    }
-}
-
-impl<T> From<TrySendError<T>> for MessageBufferError {
-    fn from(e: TrySendError<T>) -> Self {
-        match e {
-            TrySendError::Full(_) => Self::QueueFull,
-            TrySendError::Closed(_) => Self::Stopped,
         }
     }
 }
@@ -115,6 +109,11 @@ impl Batcher {
         main_rx: &mut mpsc::Receiver<Item<T>>,
         retry_q: &mut mpsc::Receiver<Item<T>>,
     ) -> Result<Item<T>, MessageBufferError> {
+        match retry_q.try_recv() {
+            Ok(item) => return Ok(item),
+            Err(Disconnected) => return Err(MessageBufferError::Stopped),
+            Err(Empty) => {}
+        }
         select! {
             msg_res = main_rx.recv() => {
                 msg_res.ok_or(MessageBufferError::Stopped)
@@ -352,7 +351,7 @@ impl<T: Clone + Send> Messages<T> {
     pub fn msgs(&mut self) -> Vec<Item<T>> {
         mem::take(&mut self.msgs)
     }
-    pub async fn retry(&mut self, msg: &Item<T>) -> Result<(), MessageBufferError> {
+    pub async fn add_retry(&mut self, msg: &Item<T>) -> Result<(), MessageBufferError> {
         Ok(self.retry_tx.send(msg.clone()).await?)
     }
 }
