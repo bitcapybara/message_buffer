@@ -250,7 +250,7 @@ where
     }
 
     pub async fn push(&mut self, msg: T) -> Result<(), MessageBufferError> {
-        Ok(self.main_tx.send(Item { data: msg, trys: 0 }).await?)
+        Ok(self.main_tx.send(Item::new(msg)).await?)
     }
 
     pub async fn error_receiver(&mut self) -> Option<mpsc::Receiver<E>> {
@@ -269,22 +269,28 @@ where
 /// msg and exec count
 /// 0 for new msg
 #[derive(Clone)]
-pub struct Item<T: Clone + Send + Send> {
+pub struct Item<T: Clone + Send> {
     pub data: T,
-    pub trys: usize,
+    duration: Option<Duration>,
 }
 
-impl<T: Clone + Send + Send> Item<T> {
-    fn retry(self) -> Self {
+impl<T: Clone + Send> Item<T> {
+    fn new(data: T) -> Self {
+        Self {
+            data,
+            duration: None,
+        }
+    }
+    fn with(self, duration: Duration) -> Self {
         Self {
             data: self.data,
-            trys: self.trys + 1,
+            duration: Some(duration),
         }
     }
 }
 
 pub trait BackOff {
-    fn next(&mut self) -> Duration;
+    fn next(&self, current: Option<Duration>) -> Duration;
 }
 
 pub struct ConstantBackOff(Duration);
@@ -296,14 +302,14 @@ impl ConstantBackOff {
 }
 
 impl BackOff for ConstantBackOff {
-    fn next(&mut self) -> Duration {
+    fn next(&self, _: Option<Duration>) -> Duration {
         self.0
     }
 }
 
 pub struct ExponentBackOff {
     /// used to calculate next duration
-    current: Duration,
+    init: Duration,
     /// must greater than 1
     factor: u32,
     /// max duration boundary
@@ -315,22 +321,22 @@ impl ExponentBackOff {
         if factor <= 1 {
             factor = 2;
         }
-        Self {
-            current: init,
-            factor,
-            max,
-        }
+        Self { init, factor, max }
     }
 }
 
 impl BackOff for ExponentBackOff {
-    fn next(&mut self) -> Duration {
-        let mut next = self.current * self.factor;
-        if next > self.max {
-            next = self.max;
+    fn next(&self, current: Option<Duration>) -> Duration {
+        match current {
+            Some(current) => {
+                let mut next = current * self.factor;
+                if next > self.max {
+                    next = self.max;
+                }
+                next
+            }
+            None => self.init,
         }
-        self.current = next;
-        next
     }
 }
 
@@ -351,16 +357,18 @@ impl<T: Clone + Send> Messages<T> {
     }
 }
 
-struct RetryQueue<T>(DelayQueue<T>);
+struct RetryQueue<T: Clone + Send>(DelayQueue<Item<T>>);
 
-impl<T> RetryQueue<T> {
-    fn insert(&mut self, value: T, timeout: Duration) {
-        self.0.insert(value, timeout);
+impl<T: Clone + Send> RetryQueue<T> {
+    fn insert(&mut self, item: Item<T>) {
+        if let Some(duration) = item.duration {
+            self.0.insert(item, duration);
+        }
     }
 }
 
-impl<T> Stream for RetryQueue<T> {
-    type Item = T;
+impl<T: Clone + Send> Stream for RetryQueue<T> {
+    type Item = Item<T>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
@@ -379,7 +387,7 @@ struct Worker<P, T: Clone + Send + Send, E, B> {
     main_rx: mpsc::Receiver<Item<T>>,
     error_tx: Option<mpsc::Sender<E>>,
     batcher: Batcher,
-    retry_q: RetryQueue<Item<T>>,
+    retry_q: RetryQueue<T>,
 }
 
 impl<P, T, E, B> Worker<P, T, E, B>
@@ -433,8 +441,8 @@ where
     }
 
     async fn retry_loop(
-        mut retry_q: RetryQueue<Item<T>>,
-        mut backoff: B,
+        mut retry_q: RetryQueue<T>,
+        backoff: B,
         retry_q_tx: mpsc::Sender<Item<T>>,
         mut retry_rx: mpsc::Receiver<Item<T>>,
     ) -> Result<(), MessageBufferError> {
@@ -448,7 +456,8 @@ where
                 retry_rx_res = retry_rx.recv() => {
                     match retry_rx_res {
                         Some(item) => {
-                            retry_q.insert(item.retry(), backoff.next());
+                            let duration = backoff.next(item.duration);
+                            retry_q.insert(item.with(duration));
                         }
                         None => {
                             return Err(MessageBufferError::Stopped);
