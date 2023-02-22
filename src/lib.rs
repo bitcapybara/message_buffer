@@ -230,7 +230,14 @@ where
         }
 
         // start worker
-        let worker = Worker::new(processor, options.batcher, backoff, main_rx, error_tx);
+        let worker = Worker::new(
+            options.cap,
+            processor,
+            options.batcher,
+            backoff,
+            main_rx,
+            error_tx,
+        );
 
         Self {
             main_tx,
@@ -380,7 +387,8 @@ impl<T: Clone + Send> Stream for RetryQueue<T> {
     }
 }
 
-struct Worker<P, T: Clone + Send + Send, E, B> {
+struct Worker<P, T: Clone + Send, E, B> {
+    retry_cap: usize,
     processor: P,
     backoff: B,
     main_rx: mpsc::Receiver<Item<T>>,
@@ -398,6 +406,7 @@ where
     B: BackOff + Send + 'static,
 {
     fn new(
+        retry_cap: usize,
         processor: P,
         batcher: Batcher,
         backoff: B,
@@ -405,6 +414,7 @@ where
         error_tx: Option<mpsc::Sender<E>>,
     ) -> Self {
         Self {
+            retry_cap,
             processor,
             backoff,
             main_rx,
@@ -415,8 +425,10 @@ where
     }
 
     async fn start(self) -> Result<(), MessageBufferError> {
+        // user -> retry_tx, retry_rx -> retry_q
         let (retry_tx, retry_rx) = mpsc::channel::<Item<T>>(1);
-        let (retry_q_tx, retry_q_rx) = mpsc::channel::<Item<T>>(1);
+        // retry_q -> retry_q_tx, retry_q_rx -> poll
+        let (retry_q_tx, retry_q_rx) = mpsc::channel::<Item<T>>(self.retry_cap);
 
         // retry loop task
         let (retry_task, retry_handle) =
