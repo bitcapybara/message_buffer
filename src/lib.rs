@@ -401,7 +401,7 @@ impl<P, T, E, B> Worker<P, T, E, B>
 where
     P: Processor<T, E> + Send + Sync + 'static,
     P::Future: Send + 'static,
-    T: Clone + Send + Send + 'static,
+    T: Clone + Send + 'static,
     E: Send + 'static,
     B: BackOff + Send + 'static,
 {
