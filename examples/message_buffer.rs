@@ -24,12 +24,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn process(mut m: Messages<usize>) -> Result<(), String> {
-    let msgs = m.msgs();
-    for msg in msgs {
+    for msg in m.msgs() {
         println!("received {}", msg.data);
-        if msg.trys > 1 {
-            continue;
-        }
         if let Err(e) = m.add_retry(&msg).await {
             println!("process retry err: {e}")
         }
