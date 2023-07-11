@@ -2,6 +2,7 @@
 
 use std::{error::Error, fmt::Display, future::Future, mem, task::Poll, time::Duration};
 
+use async_trait::async_trait;
 use futures::{
     future::{self, RemoteHandle},
     FutureExt, Stream, StreamExt,
@@ -17,7 +18,7 @@ use tokio::{
     },
     time::timeout,
 };
-use tokio_util::time::DelayQueue;
+use tokio_util::{sync::CancellationToken, time::DelayQueue};
 
 #[derive(Debug)]
 pub enum MessageBufferError {
@@ -42,10 +43,9 @@ impl<T: Clone + Send> From<SendError<Item<T>>> for MessageBufferError {
     }
 }
 
+#[async_trait]
 pub trait Processor<T: Clone + Send, E> {
-    type Future: Future<Output = Result<(), E>>;
-
-    fn call(&mut self, msgs: Messages<T>) -> Self::Future;
+    async fn call(&mut self, msgs: Messages<T>) -> Result<(), E>;
 }
 
 pub fn processor_fn<F>(f: F) -> ProcessorFn<F> {
@@ -56,16 +56,15 @@ pub struct ProcessorFn<F> {
     f: F,
 }
 
+#[async_trait]
 impl<T, Fut, F, E> Processor<T, E> for ProcessorFn<F>
 where
-    T: Clone + Send,
-    F: Fn(Messages<T>) -> Fut,
-    Fut: Future<Output = Result<(), E>>,
+    T: Clone + Send + 'static,
+    F: Fn(Messages<T>) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<(), E>> + Send,
 {
-    type Future = Fut;
-
-    fn call(&mut self, msgs: Messages<T>) -> Self::Future {
-        (self.f)(msgs)
+    async fn call(&mut self, msgs: Messages<T>) -> Result<(), E> {
+        (self.f)(msgs).await
     }
 }
 
@@ -101,25 +100,28 @@ impl Batcher {
                 batch_size,
                 timeout,
             }) => Self::poll_batch(batch_size, timeout, main_rx, retry_q).await,
-            None => Self::poll_one(main_rx, retry_q).await.map(|msg| vec![msg]),
+            None => Self::poll_one(main_rx, retry_q).await.map(|msg| match msg {
+                Some(item) => vec![item],
+                None => vec![],
+            }),
         }
     }
 
     async fn poll_one<T: Clone + Send>(
         main_rx: &mut mpsc::Receiver<Item<T>>,
         retry_q: &mut mpsc::Receiver<Item<T>>,
-    ) -> Result<Item<T>, MessageBufferError> {
+    ) -> Result<Option<Item<T>>, MessageBufferError> {
         match retry_q.try_recv() {
-            Ok(item) => return Ok(item),
-            Err(Disconnected) => return Err(MessageBufferError::Stopped),
+            Ok(item) => return Ok(Some(item)),
+            Err(Disconnected) => return Ok(None),
             Err(Empty) => {}
         }
         select! {
             msg_res = main_rx.recv() => {
-                msg_res.ok_or(MessageBufferError::Stopped)
+                Ok(msg_res)
             }
             ex_res = retry_q.recv() => {
-                ex_res.ok_or(MessageBufferError::Stopped)
+                Ok(ex_res)
             }
         }
     }
@@ -133,8 +135,9 @@ impl Batcher {
         let mut msgs = Vec::with_capacity(bsz);
         match timeout(tmot, async {
             while msgs.len() < bsz {
-                let msg = Self::poll_one(main_rx, retry_q).await?;
-                msgs.push(msg);
+                if let Some(item) = Self::poll_one(main_rx, retry_q).await? {
+                    msgs.push(item)
+                }
             }
             Ok(())
         })
@@ -210,6 +213,7 @@ pub struct MessageBuffer<P, B, T: Clone + Send, E> {
     error_rx: Option<mpsc::Receiver<E>>,
     worker: Option<Worker<P, T, E, B>>,
     worker_handle: Option<RemoteHandle<Result<(), MessageBufferError>>>,
+    token: CancellationToken,
 }
 
 impl<P, B, T, E> MessageBuffer<P, B, T, E>
@@ -217,7 +221,6 @@ where
     T: Clone + Send + 'static,
     E: Send + 'static,
     P: Processor<T, E> + Send + Sync + 'static,
-    P::Future: Send + 'static,
     B: BackOff + Send + 'static,
 {
     pub fn new(processor: P, backoff: B, options: Options) -> Self {
@@ -244,12 +247,13 @@ where
             worker: Some(worker),
             worker_handle: None,
             error_rx,
+            token: CancellationToken::new(),
         }
     }
 
     pub fn start(&mut self) {
         if let Some(worker) = self.worker.take() {
-            let (worker_task, worker_handle) = worker.start().remote_handle();
+            let (worker_task, worker_handle) = worker.start(self.token.clone()).remote_handle();
             tokio::spawn(worker_task);
             self.worker_handle.replace(worker_handle);
         }
@@ -265,6 +269,7 @@ where
 
     pub async fn stop(self) -> Result<(), MessageBufferError> {
         drop(self.main_tx);
+        self.token.cancel();
         if let Some(worker_handle) = self.worker_handle {
             worker_handle.await?;
         }
@@ -400,7 +405,6 @@ struct Worker<P, T: Clone + Send, E, B> {
 impl<P, T, E, B> Worker<P, T, E, B>
 where
     P: Processor<T, E> + Send + Sync + 'static,
-    P::Future: Send + 'static,
     T: Clone + Send + 'static,
     E: Send + 'static,
     B: BackOff + Send + 'static,
@@ -424,15 +428,21 @@ where
         }
     }
 
-    async fn start(self) -> Result<(), MessageBufferError> {
+    async fn start(self, token: CancellationToken) -> Result<(), MessageBufferError> {
         // user -> retry_tx, retry_rx -> retry_q
         let (retry_tx, retry_rx) = mpsc::channel::<Item<T>>(1);
         // retry_q -> retry_q_tx, retry_q_rx -> poll
         let (retry_q_tx, retry_q_rx) = mpsc::channel::<Item<T>>(self.retry_cap);
 
         // retry loop task
-        let (retry_task, retry_handle) =
-            Self::retry_loop(self.retry_q, self.backoff, retry_q_tx, retry_rx).remote_handle();
+        let (retry_task, retry_handle) = Self::retry_loop(
+            self.retry_q,
+            self.backoff,
+            retry_q_tx,
+            retry_rx,
+            token.child_token(),
+        )
+        .remote_handle();
         tokio::spawn(retry_task);
 
         // process loop task
@@ -443,6 +453,7 @@ where
             self.main_rx,
             retry_tx,
             retry_q_rx,
+            token.child_token(),
         )
         .remote_handle();
         tokio::spawn(process_task);
@@ -456,6 +467,7 @@ where
         backoff: B,
         retry_q_tx: mpsc::Sender<Item<T>>,
         mut retry_rx: mpsc::Receiver<Item<T>>,
+        token: CancellationToken,
     ) -> Result<(), MessageBufferError> {
         loop {
             select! {
@@ -471,9 +483,12 @@ where
                             retry_q.insert(item.with(duration));
                         }
                         None => {
-                            return Err(MessageBufferError::Stopped);
+                            return Ok(());
                         },
                     }
+                }
+                _ = token.cancelled() => {
+                    return Ok(())
                 }
             }
         }
@@ -486,13 +501,21 @@ where
         mut main_rx: mpsc::Receiver<Item<T>>,
         retry_tx: mpsc::Sender<Item<T>>,
         mut retry_q_rx: mpsc::Receiver<Item<T>>,
+        token: CancellationToken,
     ) -> Result<(), MessageBufferError> {
         loop {
-            let poll_msgs = batcher.poll(&mut main_rx, &mut retry_q_rx).await?;
-            let msgs = Messages::new(poll_msgs, retry_tx.clone());
-            if let Err(e) = processor.call(msgs).await {
-                if let Some(e_tx) = &error_tx {
-                    let _ = e_tx.try_send(e);
+            select! {
+                poll_msgs = batcher.poll(&mut main_rx, &mut retry_q_rx) => {
+                    let poll_msgs = poll_msgs?;
+                    let msgs = Messages::new(poll_msgs, retry_tx.clone());
+                    if let Err(e) = processor.call(msgs).await {
+                        if let Some(e_tx) = &error_tx {
+                            let _ = e_tx.try_send(e);
+                        }
+                    }
+                }
+                _ = token.cancelled() => {
+                    return Ok(())
                 }
             }
         }
