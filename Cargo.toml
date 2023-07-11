@@ -4,12 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async-trait = "0.1.71"
-futures = "0.3.26"
-tokio = { version = "1.25.0", features = ["rt", "sync", "time", "macros"] }
-tokio-util = { version = "0.7.6", features = ["time"] }
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["time"] }
 
 [dev-dependencies]
-anyhow = "1.0.69"
-tokio = { version = "1.25.0", features = ["rt-multi-thread"] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 

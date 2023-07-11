@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{error::Error, fmt::Display, future::Future, mem, task::Poll, time::Duration};
+use std::{future::Future, mem, task::Poll, time::Duration};
 
 use async_trait::async_trait;
 use futures::{
@@ -20,21 +20,12 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, time::DelayQueue};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum MessageBufferError {
+    #[error("Message buffer queue is full")]
     QueueFull,
+    #[error("Message buffer already stopped")]
     Stopped,
-}
-
-impl Error for MessageBufferError {}
-
-impl Display for MessageBufferError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::QueueFull => write!(f, "Message buffer queue is full"),
-            Self::Stopped => write!(f, "Message buffer already stopped"),
-        }
-    }
 }
 
 impl<T: Clone + Send> From<SendError<Item<T>>> for MessageBufferError {
