@@ -5,14 +5,14 @@ use tokio::time;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut mb = MessageBuffer::new(
+    let mb = MessageBuffer::new(
         processor_fn(process),
         ConstantBackOff::new(Duration::from_secs(1)),
         Options::default(),
     );
     for i in 0..10 {
         println!("=========");
-        if let Err(e) = mb.push(i).await {
+        if let Err(e) = mb.try_push(i).await {
             println!("push err: {e}")
         }
         println!("pushed");

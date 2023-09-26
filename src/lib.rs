@@ -1,6 +1,16 @@
 #![allow(dead_code)]
 
-use std::{future::Future, mem, task::Poll, time::Duration};
+use std::{
+    cmp,
+    future::Future,
+    mem,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::Poll,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures::{future, FutureExt, Stream, StreamExt};
@@ -12,6 +22,7 @@ use tokio::{
             self,
             error::{TryRecvError::Disconnected, TryRecvError::Empty},
         },
+        Mutex,
     },
     time::timeout,
 };
@@ -139,7 +150,7 @@ impl Batcher {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Options {
     batcher: Batcher,
     rcv_err: bool,
@@ -187,8 +198,8 @@ impl OptionsBuilder {
         self
     }
 
-    pub fn capacity(mut self, cap: usize) -> Self {
-        self.cap = cap;
+    pub fn worker_capacity(mut self, cap: usize) -> Self {
+        self.cap = cmp::max(1, cap);
         self
     }
 
@@ -211,11 +222,17 @@ impl OptionsBuilder {
     }
 }
 
+struct ErrorChan<E> {
+    tx: Option<mpsc::Sender<E>>,
+    rx: Arc<Mutex<Option<mpsc::Receiver<E>>>>,
+}
+
 pub struct MessageBuffer<P, B, T, E> {
     processor: P,
     backoff: B,
-    error_queue: (Option<mpsc::Sender<E>>, Option<mpsc::Receiver<E>>),
-    worker_queue: Vec<mpsc::Sender<Item<T>>>,
+    error_queue: ErrorChan<E>,
+    worker_index: AtomicUsize,
+    worker_queue: Arc<Mutex<Vec<mpsc::Sender<Item<T>>>>>,
     token: CancellationToken,
     options: Options,
 }
@@ -237,25 +254,47 @@ where
         }
 
         Self {
-            error_queue: (error_tx, error_rx),
+            error_queue: ErrorChan {
+                tx: error_tx,
+                rx: Arc::new(Mutex::new(error_rx)),
+            },
             token: CancellationToken::new(),
-            worker_queue: vec![],
+            worker_queue: Arc::new(Mutex::new(vec![])),
             options,
             processor,
             backoff,
+            worker_index: AtomicUsize::new(0),
         }
     }
 
-    pub async fn push(&mut self, msg: T) -> Result<(), MessageBufferError> {
-        for queue in self.worker_queue.iter() {
+    pub async fn try_push(&self, msg: T) -> Result<(), MessageBufferError> {
+        let workers = self.get_worker_txs().await;
+        for (index, queue) in workers.iter().enumerate() {
             if queue.try_send(Item::new(msg.clone())).is_ok() {
+                self.worker_index.store(index + 1, Ordering::Relaxed);
                 return Ok(());
             }
         }
-        if self.worker_queue.len() >= self.options.pool_size {
+        if workers.len() >= self.options.pool_size {
             return Err(MessageBufferError::QueueFull);
         }
+        self.new_worker(msg).await;
+        Ok(())
+    }
+
+    pub async fn push(&mut self, msg: T) {
+        if self.worker_num().await < self.options.pool_size {
+            self.new_worker(msg).await;
+            return;
+        }
+        if let Some(worker) = self.get_worker().await {
+            worker.send(Item::new(msg)).await.ok();
+        }
+    }
+
+    async fn new_worker(&self, msg: T) {
         let (main_tx, main_rx) = mpsc::channel(self.options.worker_cap);
+        main_tx.send(Item::new(msg)).await.ok();
         // start worker
         let worker = Worker::new(
             self.options.worker_cap,
@@ -263,19 +302,44 @@ where
             self.options.batcher.clone(),
             self.backoff.clone(),
             main_rx,
-            self.error_queue.0.clone(),
+            self.error_queue.tx.clone(),
         );
         tokio::spawn(worker.start(self.token.child_token()));
-        self.worker_queue.push(main_tx);
-        Ok(())
+        self.add_worker_tx(main_tx).await;
     }
 
-    pub async fn error_receiver(&mut self) -> Option<mpsc::Receiver<E>> {
-        self.error_queue.1.take()
+    async fn add_worker_tx(&self, tx: mpsc::Sender<Item<T>>) {
+        let mut workers = self.worker_queue.lock().await;
+        workers.push(tx);
+    }
+
+    async fn get_worker_txs(&self) -> Vec<mpsc::Sender<Item<T>>> {
+        let workers = self.worker_queue.lock().await;
+        let mut res = Vec::with_capacity(workers.len());
+        for tx in workers.iter() {
+            res.push(tx.clone());
+        }
+        res
+    }
+
+    async fn get_worker(&self) -> Option<mpsc::Sender<Item<T>>> {
+        let next = self.worker_index.fetch_add(1, Ordering::Relaxed);
+        let workers = self.worker_queue.lock().await;
+        workers.get(next / workers.len()).cloned()
+    }
+
+    async fn worker_num(&self) -> usize {
+        let workers = self.worker_queue.lock().await;
+        workers.len()
+    }
+
+    pub async fn error_receiver(&self) -> Option<mpsc::Receiver<E>> {
+        self.error_queue.rx.lock().await.take()
     }
 
     pub async fn stop(self) -> Result<(), MessageBufferError> {
-        for queue in self.worker_queue {
+        let mut workers = self.worker_queue.lock().await;
+        while let Some(queue) = workers.pop() {
             drop(queue)
         }
         self.token.cancel();
