@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
+num_cpus = "1.16.0"
 thiserror = "1"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tokio-util = { version = "0.7", features = ["time"] }

@@ -3,10 +3,7 @@
 use std::{future::Future, mem, task::Poll, time::Duration};
 
 use async_trait::async_trait;
-use futures::{
-    future::{self, RemoteHandle},
-    FutureExt, Stream, StreamExt,
-};
+use futures::{future, FutureExt, Stream, StreamExt};
 use tokio::{
     select,
     sync::{
@@ -35,7 +32,7 @@ impl<T: Clone + Send> From<SendError<Item<T>>> for MessageBufferError {
 }
 
 #[async_trait]
-pub trait Processor<T: Clone + Send, E> {
+pub trait Processor<T: Clone + Send, E>: Clone {
     async fn call(&mut self, msgs: Messages<T>) -> Result<(), E>;
 }
 
@@ -43,6 +40,7 @@ pub fn processor_fn<F>(f: F) -> ProcessorFn<F> {
     ProcessorFn { f }
 }
 
+#[derive(Clone)]
 pub struct ProcessorFn<F> {
     f: F,
 }
@@ -51,7 +49,7 @@ pub struct ProcessorFn<F> {
 impl<T, Fut, F, E> Processor<T, E> for ProcessorFn<F>
 where
     T: Clone + Send + 'static,
-    F: Fn(Messages<T>) -> Fut + Send + Sync,
+    F: Fn(Messages<T>) -> Fut + Send + Sync + Clone,
     Fut: Future<Output = Result<(), E>> + Send,
 {
     async fn call(&mut self, msgs: Messages<T>) -> Result<(), E> {
@@ -59,7 +57,7 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Batch {
     batch_size: usize,
     timeout: Duration,
@@ -75,7 +73,7 @@ impl Batch {
 }
 
 /// batch setting
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Batcher(Option<Batch>);
 
 impl Batcher {
@@ -145,7 +143,8 @@ impl Batcher {
 pub struct Options {
     batcher: Batcher,
     rcv_err: bool,
-    cap: usize,
+    worker_cap: usize,
+    pool_size: usize,
 }
 
 impl Options {
@@ -154,6 +153,7 @@ impl Options {
             batch: None,
             rcv_err: false,
             cap: 1024,
+            pool_size: num_cpus::get() * 2,
         }
     }
 }
@@ -163,7 +163,8 @@ impl Default for Options {
         Self {
             batcher: Batcher(None),
             rcv_err: false,
-            cap: 1024,
+            worker_cap: 1024,
+            pool_size: num_cpus::get() * 2,
         }
     }
 }
@@ -172,6 +173,7 @@ pub struct OptionsBuilder {
     batch: Option<Batch>,
     rcv_err: bool,
     cap: usize,
+    pool_size: usize,
 }
 
 impl OptionsBuilder {
@@ -190,80 +192,93 @@ impl OptionsBuilder {
         self
     }
 
+    pub fn pool_size(mut self, pool_size: usize) -> Self {
+        if pool_size == 0 {
+            self.pool_size = num_cpus::get();
+        } else {
+            self.pool_size = pool_size;
+        }
+        self
+    }
+
     pub fn build(self) -> Options {
         Options {
             batcher: Batcher(self.batch),
             rcv_err: self.rcv_err,
-            cap: self.cap,
+            worker_cap: self.cap,
+            pool_size: self.pool_size,
         }
     }
 }
 
-pub struct MessageBuffer<P, B, T: Clone + Send, E> {
-    main_tx: mpsc::Sender<Item<T>>,
-    error_rx: Option<mpsc::Receiver<E>>,
-    worker: Option<Worker<P, T, E, B>>,
-    worker_handle: Option<RemoteHandle<Result<(), MessageBufferError>>>,
+pub struct MessageBuffer<P, B, T, E> {
+    processor: P,
+    backoff: B,
+    error_queue: (Option<mpsc::Sender<E>>, Option<mpsc::Receiver<E>>),
+    worker_queue: Vec<mpsc::Sender<Item<T>>>,
     token: CancellationToken,
+    options: Options,
 }
 
 impl<P, B, T, E> MessageBuffer<P, B, T, E>
 where
     T: Clone + Send + 'static,
     E: Send + 'static,
-    P: Processor<T, E> + Send + Sync + 'static,
+    P: Processor<T, E> + Clone + Send + Sync + 'static,
     B: BackOff + Send + 'static,
 {
     pub fn new(processor: P, backoff: B, options: Options) -> Self {
-        let (main_tx, main_rx) = mpsc::channel(options.cap);
         let (mut error_tx, mut error_rx) = (None, None);
+
         if options.rcv_err {
             let (e_tx, e_rx) = mpsc::channel(1);
             error_tx = Some(e_tx);
             error_rx = Some(e_rx);
         }
 
-        // start worker
-        let worker = Worker::new(
-            options.cap,
-            processor,
-            options.batcher,
-            backoff,
-            main_rx,
-            error_tx,
-        );
-
         Self {
-            main_tx,
-            worker: Some(worker),
-            worker_handle: None,
-            error_rx,
+            error_queue: (error_tx, error_rx),
             token: CancellationToken::new(),
-        }
-    }
-
-    pub fn start(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            let (worker_task, worker_handle) = worker.start(self.token.clone()).remote_handle();
-            tokio::spawn(worker_task);
-            self.worker_handle.replace(worker_handle);
+            worker_queue: vec![],
+            options,
+            processor,
+            backoff,
         }
     }
 
     pub async fn push(&mut self, msg: T) -> Result<(), MessageBufferError> {
-        Ok(self.main_tx.send(Item::new(msg)).await?)
+        for queue in self.worker_queue.iter() {
+            if queue.try_send(Item::new(msg.clone())).is_ok() {
+                return Ok(());
+            }
+        }
+        if self.worker_queue.len() >= self.options.pool_size {
+            return Err(MessageBufferError::QueueFull);
+        }
+        let (main_tx, main_rx) = mpsc::channel(self.options.worker_cap);
+        // start worker
+        let worker = Worker::new(
+            self.options.worker_cap,
+            self.processor.clone(),
+            self.options.batcher.clone(),
+            self.backoff.clone(),
+            main_rx,
+            self.error_queue.0.clone(),
+        );
+        tokio::spawn(worker.start(self.token.child_token()));
+        self.worker_queue.push(main_tx);
+        Ok(())
     }
 
     pub async fn error_receiver(&mut self) -> Option<mpsc::Receiver<E>> {
-        self.error_rx.take()
+        self.error_queue.1.take()
     }
 
     pub async fn stop(self) -> Result<(), MessageBufferError> {
-        drop(self.main_tx);
-        self.token.cancel();
-        if let Some(worker_handle) = self.worker_handle {
-            worker_handle.await?;
+        for queue in self.worker_queue {
+            drop(queue)
         }
+        self.token.cancel();
         Ok(())
     }
 }
@@ -271,7 +286,7 @@ where
 /// msg and exec count
 /// 0 for new msg
 #[derive(Clone)]
-pub struct Item<T: Clone + Send> {
+pub struct Item<T> {
     pub data: T,
     duration: Option<Duration>,
 }
@@ -291,10 +306,11 @@ impl<T: Clone + Send> Item<T> {
     }
 }
 
-pub trait BackOff {
+pub trait BackOff: Clone {
     fn next(&self, current: Option<Duration>) -> Duration;
 }
 
+#[derive(Clone)]
 pub struct ConstantBackOff(Duration);
 
 impl ConstantBackOff {
@@ -309,6 +325,7 @@ impl BackOff for ConstantBackOff {
     }
 }
 
+#[derive(Clone)]
 pub struct ExponentBackOff {
     /// used to calculate next duration
     init: Duration,
